@@ -569,7 +569,9 @@ static int response_complete(http_parser *parser) {
     if (cfg.record_all_responses) {
         assert(now > c->actual_latency_start[c->complete & MAXO] );
         uint64_t actual_latency_timing = now - c->actual_latency_start[c->complete & MAXO];
-        printf("complete %"PRIu64" @ %"PRIu64" took %"PRIu64" us\n", c->complete, now, actual_latency_timing);
+        printf("%s %"PRIu64" @ %"PRIu64" took %"PRIu64" us\n",
+	       status > 399 ? "failed" : "complete",
+	       c->complete, now, actual_latency_timing);
         hdr_record_value(thread->latency_histogram, actual_latency_timing);
         hdr_record_value(thread->real_latency_histogram, actual_latency_timing);
     
