@@ -567,9 +567,9 @@ static int response_complete(http_parser *parser) {
 
     // Record if needed, either last in batch or all, depending in cfg:
     if (cfg.record_all_responses) {
-        //printf("complete %"PRIu64" @ %"PRIu64"\n", c->complete, now);
         assert(now > c->actual_latency_start[c->complete & MAXO] );
         uint64_t actual_latency_timing = now - c->actual_latency_start[c->complete & MAXO];
+        printf("complete %"PRIu64" @ %"PRIu64" took %"PRIu64" us\n", c->complete, now, actual_latency_timing);
         hdr_record_value(thread->latency_histogram, actual_latency_timing);
         hdr_record_value(thread->real_latency_histogram, actual_latency_timing);
     
