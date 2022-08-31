@@ -276,7 +276,7 @@ void *thread_main(void *arg) {
     thread->ff = NULL;
     if ((cfg.print_realtime_latency) && (thread->tid == 0)) {
         char filename[50];
-        snprintf(filename, 50, "/filer-01/datasets/nginx/%" PRIu64 ".txt", thread->tid);
+        snprintf(filename, 50, "%" PRIu64 ".txt", thread->tid);
         thread->ff = fopen(filename, "w");
     }
 
@@ -569,7 +569,7 @@ static int response_complete(http_parser *parser) {
     if (cfg.record_all_responses) {
         assert(now > c->actual_latency_start[c->complete & MAXO] );
         uint64_t actual_latency_timing = now - c->actual_latency_start[c->complete & MAXO];
-	if(!cfg.latency) {
+	if(cfg.print_all_responses) {
 	  printf("%s %"PRIu64" @ %"PRIu64" took %"PRIu64" us\n",
 		 status > 399 ? "failed" : "complete",
 		 c->complete, now, actual_latency_timing);
@@ -875,8 +875,8 @@ static void print_hdr_latency(struct hdr_histogram* histogram, const char* descr
         print_units(n, format_time_us, 10);
         printf("\n");
     }
-    printf("\n%s\n", "  Detailed Percentile spectrum:");
-    hdr_percentiles_print(histogram, stdout, 5, 1000.0, CLASSIC);
+    // printf("\n%s\n", "  Detailed Percentile spectrum:");
+    // hdr_percentiles_print(histogram, stdout, 5, 1000.0, CLASSIC);
 }
 
 static void print_stats_latency(stats *stats) {
