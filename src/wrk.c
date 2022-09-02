@@ -247,7 +247,7 @@ int main(int argc, char **argv) {
     }
 
     printf("Completed Requests/sec (Goodput): %9.2Lf\n", req_per_s);
-    printf("Actual sent Requests/sec (Throughput): %9.2Lf\n", sent_per_s);
+    printf("Sent Requests/sec (Throughput): %9.2Lf\n", sent_per_s);
     // printf("Actual sent Requests %"PRIu64"\n", sent);
     printf("Transfer/sec: %10sB\n", format_binary(bytes_per_s));
 
