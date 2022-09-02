@@ -126,7 +126,6 @@ int main(int argc, char **argv) {
     uint64_t connections = cfg.connections / cfg.threads;
     uint64_t throughput = cfg.rate / cfg.threads;
     uint64_t stop_at     = time_us() + (cfg.duration * 1000000);
-
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
         t->tid           = i;
@@ -134,13 +133,13 @@ int main(int argc, char **argv) {
         t->connections   = connections;
         t->throughput    = throughput;
         t->stop_at       = stop_at;
+        t->sent          = 0;
         t->complete      = 0;
         t->monitored     = 0;
         t->target        = throughput/10; //Shuang
         t->accum_latency = 0;
         t->L = script_create(cfg.script, url, headers);
         script_init(L, t, argc - optind, &argv[optind]);
-
         if (i == 0) {
             cfg.pipeline = script_verify_request(t->L);
             cfg.dynamic = !script_is_static(t->L);
@@ -150,7 +149,6 @@ int main(int argc, char **argv) {
                 parser_settings.on_body         = response_body;
             }
         }
-
         if (!t->loop || pthread_create(&t->thread, NULL, &thread_main, t)) {
             char *msg = strerror(errno);
             fprintf(stderr, "unable to create thread %"PRIu64": %s\n", i, msg);
@@ -172,6 +170,7 @@ int main(int argc, char **argv) {
 
     uint64_t start    = time_us();
     uint64_t complete = 0;
+    uint64_t sent = 0;
     uint64_t bytes    = 0;
     errors errors     = { 0 };
 
@@ -190,6 +189,7 @@ int main(int argc, char **argv) {
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
         complete += t->complete;
+        sent += t->sent;
         bytes    += t->bytes;
 
         errors.connect += t->errors.connect;
@@ -214,6 +214,7 @@ int main(int argc, char **argv) {
     }
 
     long double runtime_s   = runtime_us / 1000000.0;
+    long double sent_per_s = sent / runtime_s;
     long double req_per_s   = complete   / runtime_s;
     long double bytes_per_s = bytes      / runtime_s;
 
@@ -234,7 +235,7 @@ int main(int argc, char **argv) {
 
     char *runtime_msg = format_time_us(runtime_us);
 
-    printf("  %"PRIu64" requests in %s, %sB read\n",
+    printf("  %"PRIu64" completed requests in %s, %sB read\n",
             complete, runtime_msg, format_binary(bytes));
     if (errors.connect || errors.read || errors.write || errors.timeout) {
         printf("  Socket errors: connect %d, read %d, write %d, timeout %d\n",
@@ -245,7 +246,9 @@ int main(int argc, char **argv) {
         printf("  Non-2xx or 3xx responses: %d\n", errors.status);
     }
 
-    printf("Requests/sec: %9.2Lf\n", req_per_s);
+    printf("Completed Requests/sec (Goodput): %9.2Lf\n", req_per_s);
+    printf("Actual sent Requests/sec (Throughput): %9.2Lf\n", sent_per_s);
+    // printf("Actual sent Requests %"PRIu64"\n", sent);
     printf("Transfer/sec: %10sB\n", format_binary(bytes_per_s));
 
     if (script_has_done(L)) {
@@ -531,6 +534,8 @@ static uint64_t usec_to_next_send(connection *c) {
 
 static int delay_request(aeEventLoop *loop, long long id, void *data) {
     connection* c = data;
+    thread *thread = c->thread;
+    thread->sent++;
     uint64_t time_usec_to_wait = usec_to_next_send(c);
     if (time_usec_to_wait) {
         return round((time_usec_to_wait / 1000.0L) + 0.5); /* don't send, wait */

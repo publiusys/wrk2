@@ -54,6 +54,7 @@ typedef struct {
     errors errors;
     struct connection *cs;
     FILE* ff;
+    uint64_t sent;
 } thread;
 
 typedef struct {
