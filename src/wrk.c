@@ -277,7 +277,7 @@ void *thread_main(void *arg) {
     }
     
     thread->ff = NULL;
-    if ((cfg.) && (thread->tid == 0)) {
+    if ((cfg.print_realtime_latency) && (thread->tid == 0)) {
         char filename[50];
         snprintf(filename, 50, "%" PRIu64 ".txt", thread->tid);
         thread->ff = fopen(filename, "w");
