@@ -277,7 +277,7 @@ void *thread_main(void *arg) {
     }
     
     thread->ff = NULL;
-    if ((cfg.print_realtime_latency) && (thread->tid == 0)) {
+    if ((cfg.) && (thread->tid == 0)) {
         char filename[50];
         snprintf(filename, 50, "%" PRIu64 ".txt", thread->tid);
         thread->ff = fopen(filename, "w");
@@ -574,11 +574,11 @@ static int response_complete(http_parser *parser) {
     if (cfg.record_all_responses) {
         assert(now > c->actual_latency_start[c->complete & MAXO] );
         uint64_t actual_latency_timing = now - c->actual_latency_start[c->complete & MAXO];
-	// if(cfg.print_all_responses) {
-	//   printf("%s %"PRIu64" @ %"PRIu64" took %"PRIu64" us\n",
-	// 	 status > 399 ? "failed" : "complete",
-	// 	 c->complete, now, actual_latency_timing);
-	// }
+        if(cfg.print_all_responses) {
+            printf("%s %"PRIu64" @ %"PRIu64" took %"PRIu64" us\n",
+                status > 399 ? "failed" : "complete",
+                c->complete, now, actual_latency_timing);
+        }
         hdr_record_value(thread->latency_histogram, actual_latency_timing);
         hdr_record_value(thread->real_latency_histogram, actual_latency_timing);
     
