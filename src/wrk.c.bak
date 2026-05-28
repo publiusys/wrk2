@@ -1,15 +1,4 @@
 // Copyright (C) 2012 - Will Glozer.  All rights reserved.
-//
-// Open-loop load generator (vs. wrk/wrk2 closed-loop):
-//   Closed-loop: next request only sent after previous response received.
-//   Consequence: if server slows down, fewer requests/sec are sent — load
-//   self-limits and queuing delays on the server are hidden from latency.
-//   wrk2 corrects reported latency via Coordinated Omission but the actual
-//   traffic rate is still gated on responses.
-//
-//   Open-loop (this file): requests go out on a fixed schedule regardless of
-//   outstanding responses. Server-side queue buildup shows up directly in
-//   measured latency with no approximation needed.
 
 #include "wrk.h"
 #include "script.h"
@@ -21,11 +10,6 @@
 // Max recordable latency of 1 day
 #define MAX_LATENCY 24L * 60 * 60 * 1000000
 
-// Raw per-request latency in microseconds, indexed [thread][request_seq].
-// Populated only with -P flag, capped at MAXL=1,000,000 entries per thread.
-// Separate from the HDR histogram used for summary stats — both record the
-// same actual_latency_timing value, but this array preserves arrival order
-// (enabling latency-over-time plots) whereas the histogram is lossy/bucketed.
 uint64_t raw_latency[MAXTHREADS][MAXL];
 
 static struct config {
@@ -140,7 +124,6 @@ int main(int argc, char **argv) {
     }
 
     uint64_t connections = cfg.connections / cfg.threads;
-    // throughput here is req/sec per thread; divided further per connection in thread_main.
     uint64_t throughput = cfg.rate / cfg.threads;
     uint64_t stop_at     = time_us() + (cfg.duration * 1000000);
     for (uint64_t i = 0; i < cfg.threads; i++) {
@@ -263,10 +246,6 @@ int main(int argc, char **argv) {
         printf("  Non-2xx or 3xx responses: %d\n", errors.status);
     }
 
-    // Throughput (completed) < Load (sent) when requests are still in-flight at
-    // stop_at. The gap grows under high load. Latency histogram is also
-    // right-censored: responses not yet received at stop_at are dropped in
-    // response_complete, so the highest-latency tail is missing from stats.
     printf("Completed Requests/sec (Throughput): %9.2Lf\n", req_per_s);
     printf("Sent Requests/sec (Load): %9.2Lf\n", sent_per_s);
     // printf("Actual sent Requests %"PRIu64"\n", sent);
@@ -305,8 +284,6 @@ void *thread_main(void *arg) {
     }
 
 
-    // Convert to req/µs per connection: (req/s per thread) / 1e6 / connections.
-    // e.g. 1000 req/s total, 2 threads, 10 conns/thread → 0.00005 req/µs/conn.
     double throughput = (thread->throughput / 1000000.0) / thread->connections;
 
     connection *c = thread->cs;
@@ -316,7 +293,6 @@ void *thread_main(void *arg) {
         c->ssl        = cfg.ctx ? SSL_new(cfg.ctx) : NULL;
         c->request    = request;
         c->length     = length;
-        // Mean inter-arrival time in µs for this connection: 1 / (req/s per conn).
         c->interval   = 1000000*thread->connections/thread->throughput;
         c->throughput = throughput;
         c->complete   = 0;
@@ -475,17 +451,6 @@ static int response_body(http_parser *parser, const char *at, size_t len) {
     return 0;
 }
 
-// gen_next selects the inter-arrival time (µs) before the next request on
-// this connection. All distributions share the same mean (c->interval) but
-// differ in variance and shape:
-//   fixed: deterministic, zero variance — predictable but unrealistic.
-//   exp:   exponential (Poisson arrivals) — memoryless, models independent
-//          clients; standard assumption in queuing theory (M/M/1).
-//   zipf:  heavy-tailed, bursty — models file access / social media patterns
-//          where most gaps are short but occasional long pauses occur.
-// At the same mean rate, fixed shows the best tail latency; exp and zipf
-// expose more server-side queue buildup because of their burst structure.
-
 uint64_t gen_zipf(connection *conn)
 {
     static int first = 1;      // Static first time flag
@@ -553,21 +518,15 @@ uint64_t gen_next(connection *c) {
     return 0;
 }
 
-// Returns µs to wait before sending the next request, or 0 if it's time now.
-// KEY open-loop property: thread_next advances based on c->estimate (a
-// forward-looking send counter), NOT on c->complete (responses received).
-// In the closed-loop version this was keyed on completions, so the schedule
-// stalled whenever the server was slow. Here the schedule ticks forward
-// unconditionally — the server's latency has no effect on the send rate.
 static uint64_t usec_to_next_send(connection *c) {
     uint64_t now = time_us();
     //c->thread_next = c->thread_start + c->sent/c->throughput;
     //printf("%f\n", 1/c->throughput);
     if (c->estimate <= c->sent) {
         ++c->estimate;
-        c->thread_next += gen_next(c);  // advance schedule by one inter-arrival interval
+        c->thread_next += gen_next(c);
     }
-    if ((c->thread_next) > now)
+    if ((c->thread_next) > now) 
         return c->thread_next - now;
     else
         return 0;
@@ -576,7 +535,7 @@ static uint64_t usec_to_next_send(connection *c) {
 static int delay_request(aeEventLoop *loop, long long id, void *data) {
     connection* c = data;
     thread *thread = c->thread;
-    thread->sent++;  // counts requests dispatched (used for "Sent Requests/sec (Load)")
+    thread->sent++;
     uint64_t time_usec_to_wait = usec_to_next_send(c);
     if (time_usec_to_wait) {
         return round((time_usec_to_wait / 1000.0L) + 0.5); /* don't send, wait */
@@ -605,19 +564,14 @@ static int response_complete(http_parser *parser) {
         c->state = FIELD;
     }
 
-    // Responses arriving after stop_at are silently dropped here — not counted
-    // in thread->complete and not recorded in the histogram. This right-censors
-    // the latency distribution: the slowest requests (still in-flight at cutoff)
-    // are excluded, making tail latency look better than reality under high load.
     if (now >= thread->stop_at) {
         aeStop(thread->loop);
         goto done;
     }
 
+
     // Record if needed, either last in batch or all, depending in cfg:
     if (cfg.record_all_responses) {
-        // actual_latency_timing: wall-clock µs from first byte written to socket
-        // until on_message_complete fires — true end-to-end RTT as seen by client.
         assert(now > c->actual_latency_start[c->complete & MAXO] );
         uint64_t actual_latency_timing = now - c->actual_latency_start[c->complete & MAXO];
         if(cfg.print_all_responses) {
@@ -713,10 +667,6 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     }
     if (!c->written) {
         c->start = time_us();
-        // Circular buffer: stores send timestamp for each in-flight request,
-        // indexed by (sent % MAXO). Multiple requests can be outstanding on one
-        // connection simultaneously (open-loop), so a single scalar won't do.
-        // Matched against (complete % MAXO) in response_complete.
         c->actual_latency_start[c->sent & MAXO] = c->start;
         //if (c->sent) printf("sent %"PRIu64" @ %"PRIu64"\n", c->sent, c->actual_latency_start[c->sent & MAXO]-c->actual_latency_start[(c->sent-1) & MAXO]);
         //if (c->sent) printf("sent %"PRIu64" @ %"PRIu64"\n", c->sent, c->start);
@@ -727,10 +677,6 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     if (c->written == c->length) {
         c->written = 0;
         aeDeleteFileEvent(loop, fd, AE_WRITABLE);
-        // CRITICAL open-loop change: immediately re-register the writable event
-        // so the next request is scheduled without waiting for a response.
-        // In the closed-loop version this re-registration only happened inside
-        // response_complete once all pending responses had been received.
         aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
     }
     return;
