@@ -55,6 +55,9 @@ typedef struct {
     struct connection *cs;
     FILE* ff;
     uint64_t sent;
+    // Timestamp when trace-driven rate updates begin (set at end of calibration).
+    // Kept separate from thread->start which is reset repeatedly by sample_rate.
+    uint64_t schedule_start_us;
 } thread;
 
 typedef struct {

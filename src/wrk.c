@@ -17,9 +17,95 @@
 #include "hdr_histogram.h"
 #include "stats.h"
 #include "assert.h"
+#include <math.h>
 
 // Max recordable latency of 1 day
 #define MAX_LATENCY 24L * 60 * 60 * 1000000
+
+// Trace-driven rate schedule: rps_schedule[i] = total target RPS at experiment
+// second i, pre-computed by scaling the full trace to fit cfg.duration.
+// NULL when -f is not used (fixed rate mode).
+static uint64_t *rps_schedule  = NULL;
+static uint64_t  schedule_len  = 0;
+
+// Reads path (timestamp,rps CSV), averages every (trace_len/duration_s) rows
+// into one slot, producing a schedule of exactly duration_s entries.
+static void load_and_scale_trace(const char *path, uint64_t duration_s) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot open trace file: %s\n", path); exit(1); }
+
+    // Pass 1: count data points
+    uint64_t count = 0;
+    int ts, rps_val;
+    while (fscanf(f, "%d,%d\n", &ts, &rps_val) == 2) count++;
+    rewind(f);
+
+    // Load raw trace into a temporary array
+    uint64_t *trace = malloc(count * sizeof(uint64_t));
+    if (!trace) { fprintf(stderr, "out of memory loading trace\n"); exit(1); }
+    uint64_t trace_len = 0;
+    while (fscanf(f, "%d,%d\n", &ts, &rps_val) == 2)
+        trace[trace_len++] = (uint64_t)(rps_val > 0 ? rps_val : 1);
+    fclose(f);
+
+    // Allocate output schedule: one RPS value per experiment second
+    schedule_len  = duration_s;
+    rps_schedule  = malloc(schedule_len * sizeof(uint64_t));
+    if (!rps_schedule) { fprintf(stderr, "out of memory for schedule\n"); exit(1); }
+
+    // Scale: each experiment second covers (trace_len / duration_s) trace rows.
+    // Average those rows to produce one representative RPS for that second.
+    double scale = (double)trace_len / (double)duration_s;
+    for (uint64_t i = 0; i < schedule_len; i++) {
+        uint64_t lo = (uint64_t)floor(i       * scale);
+        uint64_t hi = (uint64_t)floor((i + 1) * scale);
+        if (hi > trace_len) hi = trace_len;
+        if (lo >= trace_len) lo = trace_len - 1;
+        uint64_t sum = 0;
+        for (uint64_t j = lo; j < hi; j++) sum += trace[j];
+        rps_schedule[i] = (hi > lo) ? sum / (hi - lo) : trace[lo];
+        if (rps_schedule[i] == 0) rps_schedule[i] = 1;
+    }
+
+    free(trace);
+    uint64_t smin = rps_schedule[0], smax = rps_schedule[0];
+    for (uint64_t i = 1; i < schedule_len; i++) {
+        if (rps_schedule[i] < smin) smin = rps_schedule[i];
+        if (rps_schedule[i] > smax) smax = rps_schedule[i];
+    }
+    printf("Trace: %"PRIu64" points -> %"PRIu64"s schedule (%.1fx compression)  "
+           "RPS min=%"PRIu64" max=%"PRIu64"\n",
+           trace_len, schedule_len, scale, smin, smax);
+}
+
+// [Twitter cache trace] -S / --print-schedule debug helper.
+// Prints every entry of the computed (and optionally maxrps-scaled) schedule,
+// one line per second:  <second> <rps>
+// Pipe to gnuplot or awk to verify the shape before committing to a full run.
+// Exits immediately after printing so no load is generated.
+static void print_rps_schedule() {
+    if (!rps_schedule) {
+        fprintf(stderr, "No schedule loaded (use -f to load a trace file)\n");
+        return;
+    }
+
+    // Header summary
+    uint64_t smin = rps_schedule[0], smax = rps_schedule[0];
+    uint64_t sum  = 0;
+    for (uint64_t i = 0; i < schedule_len; i++) {
+        if (rps_schedule[i] < smin) smin = rps_schedule[i];
+        if (rps_schedule[i] > smax) smax = rps_schedule[i];
+        sum += rps_schedule[i];
+    }
+    printf("# schedule entries : %"PRIu64"\n", schedule_len);
+    printf("# RPS min / mean / max : %"PRIu64" / %"PRIu64" / %"PRIu64"\n",
+           smin, sum / schedule_len, smax);
+    printf("# second rps\n");
+
+    // One data line per second — machine-readable for easy piping
+    for (uint64_t i = 0; i < schedule_len; i++)
+        printf("%"PRIu64" %"PRIu64"\n", i, rps_schedule[i]);
+}
 
 // Raw per-request latency in microseconds, indexed [thread][request_seq].
 // Populated only with -P flag, capped at MAXL=1,000,000 entries per thread.
@@ -42,6 +128,10 @@ static struct config {
     bool     record_all_responses;
     bool     print_all_responses;
     bool     print_realtime_latency;
+    char    *trace_file;     // -f: path to timestamp,rps CSV; drives varying rate
+    uint64_t maxrps;         // --maxrps: scale schedule so its peak equals this value;
+                             //   every entry is multiplied by (maxrps / schedule_max)
+    bool     print_schedule; // [Twitter cache trace] -S: print full schedule and exit
     char    *script;
     SSL_CTX *ctx;
 } cfg;
@@ -64,6 +154,10 @@ static struct http_parser_settings parser_settings = {
 };
 
 static volatile sig_atomic_t stop = 0;
+
+// Forward declaration: update_rate is registered from inside calibrate() but
+// defined later in the file.
+static int update_rate(aeEventLoop *loop, long long id, void *data);
 
 static void handler(int sig) {
     stop = 1;
@@ -89,7 +183,14 @@ static void usage() {
            "    -v, --version          Print version details                 \n"
            "    -R, --rate        <T>  work rate (throughput)                \n"
            "                           in requests/sec (total)               \n"
-           "                           [Required Parameter]                  \n"
+           "                           [Required unless -f is used]          \n"
+           "    -f, --trace       <F>  CSV file (timestamp,rps) to drive     \n"
+           "                           rate dynamically; trace is scaled to  \n"
+           "                           fit the -d duration automatically     \n"
+           "    -M, --maxrps      <N>  scale trace peak to N req/s           \n"
+           "                           (preserves relative shape)            \n"
+           "    -S, --print-schedule   print full RPS schedule and exit      \n"
+           "                           (dry run to verify -f / -M output)   \n"
            "                                                                 \n"
            "                                                                 \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)           \n"
@@ -103,6 +204,37 @@ int main(int argc, char **argv) {
     if (parse_args(&cfg, &url, &parts, headers, argc, argv)) {
         usage();
         exit(1);
+    }
+
+    // If a trace file was given, pre-compute the per-second RPS schedule.
+    // Must happen before threads start so rps_schedule is ready at calibration.
+    if (cfg.trace_file) {
+        load_and_scale_trace(cfg.trace_file, cfg.duration);
+
+        // --maxrps: find the peak in the computed schedule and rescale every
+        // entry proportionally so that peak == maxrps.  All relative shapes
+        // (diurnal curve, spikes) are preserved; only the absolute magnitude
+        // is adjusted.  Useful for targeting a specific server capacity.
+        if (cfg.maxrps > 0) {
+            uint64_t schedule_max = 0;
+            for (uint64_t i = 0; i < schedule_len; i++)
+                if (rps_schedule[i] > schedule_max)
+                    schedule_max = rps_schedule[i];
+            printf("Scaling schedule peak %"PRIu64" -> %"PRIu64" RPS\n",
+                   schedule_max, cfg.maxrps);
+            for (uint64_t i = 0; i < schedule_len; i++) {
+                rps_schedule[i] = (uint64_t)(
+                    (double)rps_schedule[i] * cfg.maxrps / schedule_max);
+                if (rps_schedule[i] == 0) rps_schedule[i] = 1;
+            }
+        }
+
+        // [Twitter cache trace] -S: print the final schedule (post maxrps
+        // scaling) and exit so the user can verify values before a real run.
+        if (cfg.print_schedule) {
+            print_rps_schedule();
+            exit(0);
+        }
     }
 
     char *schema  = copy_url_part(url, &parts, UF_SCHEMA);
@@ -410,7 +542,50 @@ static int calibrate(aeEventLoop *loop, long long id, void *data) {
 
     aeCreateTimeEvent(loop, thread->interval, sample_rate, thread, NULL);
 
+    // Start trace-driven rate updates now that calibration is complete.
+    // schedule_start_us anchors elapsed-second calculations in update_rate.
+    if (rps_schedule) {
+        thread->schedule_start_us = time_us();
+        aeCreateTimeEvent(loop, 0, update_rate, thread, NULL);
+    }
+
     return AE_NOMORE;
+}
+
+// Fires every 1000ms. Looks up the RPS for the current experiment second from
+// the pre-computed schedule, then updates c->interval on every connection.
+// When rate increases, thread_next is reset to now to avoid a catch-up burst.
+static int update_rate(aeEventLoop *loop, long long id, void *data) {
+    thread *thread = data;
+    uint64_t elapsed_s = (time_us() - thread->schedule_start_us) / 1000000;
+
+    if (elapsed_s >= schedule_len) return AE_NOMORE;
+
+    uint64_t total_rps      = rps_schedule[elapsed_s];
+    uint64_t per_thread_rps = total_rps / cfg.threads;
+    if (per_thread_rps == 0) per_thread_rps = 1;
+
+    // Print one line per second so the live rate progression is visible.
+    // Only thread 0 prints to avoid duplicate lines across threads.
+    if (thread->tid == 0) {
+        printf("[trace %5"PRIu64"s / %"PRIu64"s]  target RPS: %"PRIu64"\n",
+               elapsed_s, schedule_len, total_rps);
+        fflush(stdout);
+    }
+
+    uint64_t now = time_us();
+    connection *c = thread->cs;
+    for (uint64_t i = 0; i < thread->connections; i++, c++) {
+        uint64_t new_interval = 1000000 * thread->connections / per_thread_rps;
+        if (new_interval < c->interval) {
+            // Rate increased: reset next-send time so we don't burst to catch up.
+            c->thread_next = now;
+        }
+        c->interval = new_interval;
+    }
+    thread->throughput = per_thread_rps;
+
+    return 1000;  // re-fire in 1000ms (one schedule step)
 }
 
 static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
@@ -795,6 +970,9 @@ static struct option longopts[] = {
     { "version",        no_argument,       NULL, 'v' },
     { "rate",           required_argument, NULL, 'R' },
     { "dist",           required_argument, NULL, 'D' },
+    { "trace",          required_argument, NULL, 'f' },
+    { "maxrps",         required_argument, NULL, 'M' },
+    { "print-schedule", no_argument,       NULL, 'S' },
     { NULL,             0,                 NULL,  0  }
 };
 
@@ -813,7 +991,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->print_realtime_latency = false;
     cfg->dist = 0;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:D:H:T:R:LPpBv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:D:H:T:R:f:M:SLPpBv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -859,6 +1037,15 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
             case 'R':
                 if (scan_metric(optarg, &cfg->rate)) return -1;
                 break;
+            case 'f':
+                cfg->trace_file = optarg;
+                break;
+            case 'M':
+                if (scan_metric(optarg, &cfg->maxrps)) return -1;
+                break;
+            case 'S':
+                cfg->print_schedule = true;
+                break;
             case 'v':
                 printf("wrk %s [%s] ", VERSION, aeGetApiName());
                 printf("Copyright (C) 2012 Will Glozer\n");
@@ -883,10 +1070,18 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
         return -1;
     }
 
+    // -R is required unless -f (trace file) is provided.
+    // In trace mode, -R sets the initial warmup rate; the trace overrides it
+    // after calibration. If -R is omitted with -f, default to 100 req/s.
     if (cfg->rate == 0) {
-        fprintf(stderr,
-                "Throughput MUST be specified with the --rate or -R option\n");
-        return -1;
+        if (cfg->trace_file) {
+            cfg->rate = 100;
+        } else {
+            fprintf(stderr,
+                    "Throughput MUST be specified with --rate/-R, "
+                    "or use --trace/-f to drive rate from a file\n");
+            return -1;
+        }
     }
 
     *url    = argv[optind];
